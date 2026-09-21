@@ -1,0 +1,8 @@
+# real config with api key - never commit
+config.ini
+# runtime artifacts
+pos.txt
+last-state.txt
+*.log
+*.png
+*.dll

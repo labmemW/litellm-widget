@@ -1,0 +1,2 @@
+Set sh = CreateObject("WScript.Shell")
+sh.Run "powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File """ & sh.ExpandEnvironmentStrings("%USERPROFILE%") & "\.litellm-widget\litellm-widget.ps1""", 0, False
