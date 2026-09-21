@@ -83,7 +83,7 @@ namespace LiteLLMWidget
         System.Windows.Forms.Timer peekTimer;   // fast: watch cursor near docked edge
         System.Windows.Forms.Timer hideTimer;   // one-shot: retract after cursor leaves
         const int DockSnapPx = 12;              // drop within this of an edge => dock
-        const int PeekTriggerPx = 3;            // cursor within this of screen edge => peek
+        const int PeekTriggerPx = 8;            // cursor within this of screen edge => peek
         const int HideDelayMs = 1500;           // retract delay after cursor leaves
         int homeX, homeY;                       // on-screen position while docked
 
@@ -349,11 +349,24 @@ namespace LiteLLMWidget
             bool atEdge = dockedEdge == Edge.Right
                 ? p.X >= wa.Right - PeekTriggerPx
                 : p.X <= wa.Left + PeekTriggerPx;
-            bool overUs = p.X >= Location.X && p.X <= Location.X + Width
-                       && p.Y >= Location.Y && p.Y <= Location.Y + Height;
-            if ((atEdge || overUs) && !peeking) PeekNow(false);
+            // hover zone around the visible part of the window (the 6px strip counts)
+            Rectangle hover = new Rectangle(Location.X - 20, Location.Y - 20, Width + 40, Height + 40);
+            bool overUs = hover.Contains(p.X, p.Y);
+            // approach detection: moving fast toward the docked edge inside the outer band.
+            // People rarely park EXACTLY at the edge; a quick sweep that ends near it is intent.
+            int distFromEdge = dockedEdge == Edge.Right ? (wa.Right - p.X) : (p.X - wa.Left);
+            bool approaching = false;
+            if (distFromEdge >= 0 && distFromEdge < 40)
+            {
+                int dx = p.X - lastCursorX;
+                if ((dockedEdge == Edge.Right && dx > 18) || (dockedEdge == Edge.Left && dx < -18))
+                    approaching = true;   // fast move (18px/150ms) toward the edge
+            }
+            lastCursorX = p.X;
+            if ((atEdge || overUs || approaching) && !peeking) PeekNow(false);
             else if (!(atEdge || overUs) && peeking) ArmHide();
         }
+        int lastCursorX = -1;
 
         void PeekNow(bool instant)
         {
@@ -384,18 +397,35 @@ namespace LiteLLMWidget
             if (!hideTimer.Enabled) hideTimer.Start();
         }
 
+        // ---- non-blocking slide: animation timer moves the window a few px per tick ----
+        Point slideFrom, slideToTarget;
+        int slideStep, slideSteps = 6;
+        System.Windows.Forms.Timer slideTimer;
         void SlideTo(Point target)
         {
-            // simple animated slide (~120ms, 6 steps); topmost re-asserted by Render anyway
-            Point from = Location;
-            for (int i = 1; i <= 6; i++)
+            slideFrom = Location;
+            slideToTarget = target;
+            slideStep = 0;
+            if (slideTimer == null)
             {
-                int x = from.X + (target.X - from.X) * i / 6;
-                int y = from.Y + (target.Y - from.Y) * i / 6;
-                SetWindowPos(Handle, IntPtr.Zero, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
-                System.Threading.Thread.Sleep(20);
+                slideTimer = new System.Windows.Forms.Timer();
+                slideTimer.Interval = 20;
+                slideTimer.Tick += delegate
+                {
+                    slideStep++;
+                    if (slideStep >= slideSteps)
+                    {
+                        slideTimer.Stop();
+                        Location = slideToTarget;
+                        return;
+                    }
+                    int x = slideFrom.X + (slideToTarget.X - slideFrom.X) * slideStep / slideSteps;
+                    int y = slideFrom.Y + (slideToTarget.Y - slideFrom.Y) * slideStep / slideSteps;
+                    SetWindowPos(Handle, IntPtr.Zero, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+                };
             }
-            Location = target;
+            slideTimer.Stop();
+            slideTimer.Start();
         }
 
         protected override bool ShowWithoutActivation { get { return true; } }
