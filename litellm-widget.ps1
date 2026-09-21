@@ -36,11 +36,15 @@ namespace LiteLLMWidget
         [DllImport("user32.dll")] static extern bool ReleaseCapture();
         [DllImport("user32.dll")] static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
         [DllImport("user32.dll")] static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+        [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT p);
 
         const int WM_NCLBUTTONDOWN = 0xA1;
         const int HT_CAPTION = 0x2;
         static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
         const uint SWP_NOMOVE = 0x2, SWP_NOSIZE = 0x1, SWP_NOACTIVATE = 0x10;
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct POINT { public int X, Y; }
 
         static string S(string u) { return Regex.Unescape(u); } // runtime \uXXXX -> real chars
 
@@ -66,6 +70,22 @@ namespace LiteLLMWidget
         bool busy = false, warnShown = false, critShown = false, overLimit = false, initDone = false;
         string errStatus = null;
         int failCount = 0;
+        // multi-instance jitter: the proxy is an ELB-fronted cluster whose instances serve
+        // stale spend values; display the MAX seen within a window so it never jumps backwards
+        double[] spendHist = new double[5];
+        DateTime[] spendHistAt = new DateTime[5];
+        int spendHistIdx = 0;
+
+        // ---- edge dock / auto-hide ----
+        enum Edge { None, Left, Right }
+        Edge dockedEdge = Edge.None;
+        bool peeking = false;
+        System.Windows.Forms.Timer peekTimer;   // fast: watch cursor near docked edge
+        System.Windows.Forms.Timer hideTimer;   // one-shot: retract after cursor leaves
+        const int DockSnapPx = 12;              // drop within this of an edge => dock
+        const int PeekTriggerPx = 3;            // cursor within this of screen edge => peek
+        const int HideDelayMs = 1500;           // retract delay after cursor leaves
+        int homeX, homeY;                       // on-screen position while docked
 
         public WidgetForm()
         {
@@ -81,8 +101,22 @@ namespace LiteLLMWidget
             uiTimer = new System.Windows.Forms.Timer();
             uiTimer.Interval = Math.Max(10, refreshSeconds) * 1000;
             uiTimer.Tick += delegate { if (!busy) Poll(); };
+
+            peekTimer = new System.Windows.Forms.Timer();
+            peekTimer.Interval = 150;
+            peekTimer.Tick += delegate { PeekWatch(); };
+            hideTimer = new System.Windows.Forms.Timer();
+            hideTimer.Interval = HideDelayMs;
+            hideTimer.Tick += delegate { hideTimer.Stop(); Retract(); };
             LoadPos();
-            Shown += delegate { initDone = true; Poll(); uiTimer.Start(); };
+            Shown += delegate
+            {
+                initDone = true;
+                RestoreDockState();
+                peekTimer.Start();
+                Poll();
+                uiTimer.Start();
+            };
             tray.ShowBalloonTip(2000, S("\\u004c\\u0069\\u0074\\u0065\\u004c\\u004c\\u004d\\u0020\\u989d\\u5ea6\\u76d1\\u63a7"),
                 S("\\u5df2\\u542f\\u52a8\\uff0c\\u6bcf\\u0020") + refreshSeconds +
                 S("\\u0020\\u79d2\\u81ea\\u52a8\\u5237\\u65b0\\uff08\\u63a2\\u6d4b\\u96f6\\u6210\\u672c\\uff09"), ToolTipIcon.Info);
@@ -271,11 +305,106 @@ namespace LiteLLMWidget
         }
         void DragStart()
         {
+            // dragging always un-hides first so the user grabs the real window
+            if (dockedEdge != Edge.None && !peeking) PeekNow(true);
             ReleaseCapture();
             SendMessage(Handle, WM_NCLBUTTONDOWN, (IntPtr)HT_CAPTION, IntPtr.Zero);
         }
 
+        // =============== edge dock / auto-hide ===============
+        Rectangle WorkArea() { return Screen.GetWorkingArea(this); }
+
+        void OnMoveEnd()
+        {
+            if (initDone) SavePos();
+            Rectangle wa = WorkArea();
+            bool nearL = Location.X <= wa.Left + DockSnapPx;
+            bool nearR = Location.X + Width >= wa.Right - DockSnapPx;
+            if (nearL || nearR)
+            {
+                dockedEdge = nearR ? Edge.Right : Edge.Left;
+                // clamp fully onto the work area, vertical position preserved
+                homeX = dockedEdge == Edge.Right ? wa.Right - Width : wa.Left;
+                homeY = Math.Min(Math.Max(Location.Y, wa.Top), wa.Bottom - Height);
+                Location = new Point(homeX, homeY);
+                if (initDone) SavePos();
+                Retract();      // dock immediately hides
+            }
+            else if (dockedEdge != Edge.None)
+            {
+                dockedEdge = Edge.None;   // dragged away from edge: normal mode
+                peeking = false;
+                peekTimer.Stop();
+                hideTimer.Stop();
+                Opacity = opacityVal;
+            }
+        }
+
+        void PeekWatch()
+        {
+            if (dockedEdge == Edge.None) { peekTimer.Stop(); return; }
+            POINT p;
+            if (!GetCursorPos(out p)) return;
+            Rectangle wa = WorkArea();
+            bool atEdge = dockedEdge == Edge.Right
+                ? p.X >= wa.Right - PeekTriggerPx
+                : p.X <= wa.Left + PeekTriggerPx;
+            bool overUs = p.X >= Location.X && p.X <= Location.X + Width
+                       && p.Y >= Location.Y && p.Y <= Location.Y + Height;
+            if ((atEdge || overUs) && !peeking) PeekNow(false);
+            else if (!(atEdge || overUs) && peeking) ArmHide();
+        }
+
+        void PeekNow(bool instant)
+        {
+            peeking = true;
+            hideTimer.Stop();
+            if (instant)
+            {
+                Location = new Point(homeX, homeY);
+                Opacity = opacityVal;
+            }
+            else
+            {
+                SlideTo(new Point(homeX, homeY));
+            }
+        }
+
+        void Retract()
+        {
+            peeking = false;
+            Rectangle wa = WorkArea();
+            // slide out leaving a thin grab strip visible along the edge
+            int hiddenX = dockedEdge == Edge.Right ? wa.Right - 6 : wa.Left - Width + 6;
+            SlideTo(new Point(hiddenX, homeY));
+        }
+
+        void ArmHide()
+        {
+            if (!hideTimer.Enabled) hideTimer.Start();
+        }
+
+        void SlideTo(Point target)
+        {
+            // simple animated slide (~120ms, 6 steps); topmost re-asserted by Render anyway
+            Point from = Location;
+            for (int i = 1; i <= 6; i++)
+            {
+                int x = from.X + (target.X - from.X) * i / 6;
+                int y = from.Y + (target.Y - from.Y) * i / 6;
+                SetWindowPos(Handle, IntPtr.Zero, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+                System.Threading.Thread.Sleep(20);
+            }
+            Location = target;
+        }
+
         protected override bool ShowWithoutActivation { get { return true; } }
+        protected override void WndProc(ref Message m)
+        {
+            const int WM_EXITSIZEMOVE = 0x232;
+            if (m.Msg == WM_EXITSIZEMOVE) OnMoveEnd();
+            base.WndProc(ref m);
+        }
         protected override CreateParams CreateParams
         {
             get
@@ -366,7 +495,20 @@ namespace LiteLLMWidget
         }
         void SavePos()
         {
-            try { File.WriteAllText(posPath, Location.X + "," + Location.Y); } catch (Exception) { }
+            // while docked+hidden, persist the on-screen home position, not the retracted one
+            int x = Location.X, y = Location.Y;
+            if (dockedEdge != Edge.None && !peeking) { x = homeX; y = homeY; }
+            try { File.WriteAllText(posPath, x + "," + y); } catch (Exception) { }
+        }
+
+        void RestoreDockState()
+        {
+            // if the saved position sits at a work-area edge, re-dock (and hide) there
+            Rectangle wa = WorkArea();
+            if (Location.X <= wa.Left + DockSnapPx || Location.X + Width >= wa.Right - DockSnapPx)
+            {
+                OnMoveEnd();     // routes through dock logic
+            }
         }
 
         // =============== polling ===============
@@ -431,9 +573,28 @@ namespace LiteLLMWidget
             }
             double newSpend, newBudget;
             if (!TryD(s, out newSpend) || !TryD(b, out newBudget)) { errStatus = "cannot parse: " + s + " / " + b; return false; }
-            spend = newSpend; budget = newBudget; lastOk = DateTime.Now;
+            budget = newBudget;
+            spend = MaxSpend(newSpend);   // jitter fix: cluster instances serve stale values
+            lastOk = DateTime.Now;
             CheckThresholds();
             return true;
+        }
+
+        double MaxSpend(double fresh)
+        {
+            DateTime now = DateTime.Now;
+            spendHist[spendHistIdx] = fresh;
+            spendHistAt[spendHistIdx] = now;
+            spendHistIdx = (spendHistIdx + 1) % spendHist.Length;
+            // window: keep samples from the last 15 minutes; max of them is the best guess
+            // at the real total. A genuine admin reset (all servers drop) ages out naturally.
+            double max = -1;
+            for (int i = 0; i < spendHist.Length; i++)
+            {
+                if ((now - spendHistAt[i]).TotalMinutes <= 15 && spendHist[i] > max) max = spendHist[i];
+            }
+            if (max < 0) max = fresh;
+            return max;
         }
 
         static string HeaderVal(HttpResponseMessage resp, string name)
@@ -501,6 +662,7 @@ namespace LiteLLMWidget
             try
             {
                 // re-assert topmost band each refresh: other apps steal it over time
+                // (no x/y => never fights the docked/retracted position)
                 SetWindowPos(Handle, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
                 DumpState();
                 if (spend >= 0 && budget > 0)
@@ -560,7 +722,8 @@ namespace LiteLLMWidget
                     " | baseUrl=" + bstate +
                     " | keyLen=" + (apiKey == null ? -1 : apiKey.Length) +
                     " | model=" + probeModel +
-                    " | opacity=" + Opacity.ToString("0.##", CultureInfo.InvariantCulture));
+                    " | opacity=" + Opacity.ToString("0.##", CultureInfo.InvariantCulture) +
+                    " | dock=" + dockedEdge + (peeking ? "+peek" : ""));
             }
             catch (Exception) { }
         }
