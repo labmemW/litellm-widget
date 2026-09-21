@@ -72,8 +72,8 @@ namespace LiteLLMWidget
         int failCount = 0;
         // multi-instance jitter: the proxy is an ELB-fronted cluster whose instances serve
         // stale spend values; display the MAX seen within a window so it never jumps backwards
-        double[] spendHist = new double[5];
-        DateTime[] spendHistAt = new DateTime[5];
+        double[] spendHist = new double[10];
+        DateTime[] spendHistAt = new DateTime[10];
         int spendHistIdx = 0;
 
         // ---- edge dock / auto-hide ----
@@ -595,6 +595,12 @@ namespace LiteLLMWidget
             ByteArrayContent content = new ByteArrayContent(Encoding.UTF8.GetBytes(json));
             content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
             req.Content = content;
+            // critical: close the connection after every poll. The proxy is an ELB-backed
+            // cluster with per-instance (stale) spend ledgers; a pooled connection pins us
+            // to ONE instance for the whole process lifetime and can park on a stale one.
+            // A fresh connection per poll re-rolls the instance; the rolling-max then
+            // converges to the freshest ledger.
+            req.Headers.ConnectionClose = true;
 
             HttpResponseMessage resp = await http.SendAsync(req);
             string s = HeaderVal(resp, "x-litellm-key-spend");
@@ -747,6 +753,17 @@ namespace LiteLLMWidget
             return s.Length <= n ? s : s.Substring(0, n) + S("\\u2026");
         }
 
+        static string AsciiOnly(string s)
+        {
+            // exception messages are locale-localized (e.g. Chinese "task canceled");
+            // keep the debug file ASCII-readable instead of mojibake
+            if (s == null) return "";
+            char[] cs = new char[s.Length];
+            int n = 0;
+            foreach (char c in s) if (c < 128) cs[n++] = c;
+            return new string(cs, 0, n);
+        }
+
         void DumpState()
         {
             try
@@ -758,7 +775,7 @@ namespace LiteLLMWidget
                 File.WriteAllText(p, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") +
                     " | spend=" + spend.ToString(CultureInfo.InvariantCulture) +
                     " | budget=" + budget.ToString(CultureInfo.InvariantCulture) +
-                    " | err=" + (errStatus ?? "-") +
+                    " | err=" + (errStatus == null ? "-" : AsciiOnly(errStatus)) +
                     " | failCount=" + failCount +
                     " | baseUrl=" + bstate +
                     " | keyLen=" + (apiKey == null ? -1 : apiKey.Length) +
