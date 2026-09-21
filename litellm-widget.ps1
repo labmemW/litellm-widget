@@ -84,7 +84,7 @@ namespace LiteLLMWidget
         System.Windows.Forms.Timer hideTimer;   // one-shot: retract after cursor leaves
         const int DockSnapPx = 12;              // drop within this of an edge => dock
         const int PeekTriggerPx = 8;            // cursor within this of screen edge => peek
-        const int HideDelayMs = 1500;           // retract delay after cursor leaves
+        const int HideDelayMs = 500;            // retract delay after cursor leaves
         int homeX, homeY;                       // on-screen position while docked
 
         public WidgetForm()
@@ -364,7 +364,12 @@ namespace LiteLLMWidget
             }
             lastCursorX = p.X;
             if ((atEdge || overUs || approaching) && !peeking) PeekNow(false);
-            else if (!(atEdge || overUs) && peeking) ArmHide();
+            else if (!(atEdge || overUs) && peeking)
+            {
+                // during the outbound slide the window is still traveling toward the user;
+                // only start the hide countdown once it has landed (or on a retract slide)
+                if (!SlideBusy || !slideOutbound) ArmHide();
+            }
         }
         int lastCursorX = -1;
 
@@ -379,7 +384,7 @@ namespace LiteLLMWidget
             }
             else
             {
-                SlideTo(new Point(homeX, homeY));
+                SlideTo(new Point(homeX, homeY), true);
             }
         }
 
@@ -389,7 +394,7 @@ namespace LiteLLMWidget
             Rectangle wa = WorkArea();
             // slide out leaving a thin grab strip visible along the edge
             int hiddenX = dockedEdge == Edge.Right ? wa.Right - 6 : wa.Left - Width + 6;
-            SlideTo(new Point(hiddenX, homeY));
+            SlideTo(new Point(hiddenX, homeY), false);
         }
 
         void ArmHide()
@@ -400,12 +405,14 @@ namespace LiteLLMWidget
         // ---- non-blocking slide: animation timer moves the window a few px per tick ----
         Point slideFrom, slideToTarget;
         int slideStep, slideSteps = 6;
+        bool slideOutbound;   // true = sliding OUT (peek), false = sliding back (retract)
         System.Windows.Forms.Timer slideTimer;
-        void SlideTo(Point target)
+        void SlideTo(Point target, bool outbound)
         {
             slideFrom = Location;
             slideToTarget = target;
             slideStep = 0;
+            slideOutbound = outbound;
             if (slideTimer == null)
             {
                 slideTimer = new System.Windows.Forms.Timer();
@@ -417,6 +424,9 @@ namespace LiteLLMWidget
                     {
                         slideTimer.Stop();
                         Location = slideToTarget;
+                        // after an outbound slide lands, re-evaluate the cursor: if the user
+                        // already moved away mid-animation, arm the hide right now
+                        if (slideOutbound) PeekWatch();
                         return;
                     }
                     int x = slideFrom.X + (slideToTarget.X - slideFrom.X) * slideStep / slideSteps;
@@ -427,6 +437,7 @@ namespace LiteLLMWidget
             slideTimer.Stop();
             slideTimer.Start();
         }
+        bool SlideBusy { get { return slideTimer != null && slideTimer.Enabled; } }
 
         protected override bool ShowWithoutActivation { get { return true; } }
         protected override void WndProc(ref Message m)
