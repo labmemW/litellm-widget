@@ -44,7 +44,10 @@
 
 ## 有用的事实
 
-- 轮询零成本:发空 messages 的必 400 请求,响应头照样带用量;不要换成真请求
+- 探测是合法最小请求("hi" + max_tokens=1,约 ¥0.00002/次,last-state 里 spend 可见非零):
+  2026-10 起网关按失败率封 key(超 80% 封禁),旧"空 messages 必 400"零成本探测每天制造
+  ~1440 次失败调用,经用户决定弃用——不要改回零成本探测
+- 超预算后轮询退避为 30 分钟一次(OverLimitRefreshSeconds 常量);429 响应体解析额度路径不变
 - 超限时 LiteLLM 返回 429,响应体含 "Current cost: X, Max budget: Y",widget 会解析
 - 额度重置通常靠管理员手动或 budget_duration 自动(看部署),没有通用查询接口;
   重置后 widget 下轮自动恢复,阈值提醒重新武装

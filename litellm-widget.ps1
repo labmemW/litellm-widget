@@ -51,6 +51,7 @@ namespace LiteLLMWidget
         // ---- config ----
         string baseUrl, apiKey, probeModel, cfgPath, posPath;
         int refreshSeconds = 60;
+        const int OverLimitRefreshSeconds = 1800;  // over budget: 429s also count as failed calls, back off to 30 min
         double warnPct = 80.0, critPct = 95.0;
         double opacityVal = 0.85;
         string uiFontFamily = "Microsoft YaHei UI";
@@ -99,7 +100,7 @@ namespace LiteLLMWidget
             BuildTray();
             InitHttp();
             uiTimer = new System.Windows.Forms.Timer();
-            uiTimer.Interval = Math.Max(10, refreshSeconds) * 1000;
+            ApplyTimerInterval();
             uiTimer.Tick += delegate { if (!busy) Poll(); };
 
             peekTimer = new System.Windows.Forms.Timer();
@@ -119,7 +120,7 @@ namespace LiteLLMWidget
             };
             tray.ShowBalloonTip(2000, S("\\u004c\\u0069\\u0074\\u0065\\u004c\\u004c\\u004d\\u0020\\u989d\\u5ea6\\u76d1\\u63a7"),
                 S("\\u5df2\\u542f\\u52a8\\uff0c\\u6bcf\\u0020") + refreshSeconds +
-                S("\\u0020\\u79d2\\u81ea\\u52a8\\u5237\\u65b0\\uff08\\u63a2\\u6d4b\\u96f6\\u6210\\u672c\\uff09"), ToolTipIcon.Info);
+                S("\\u0020\\u79d2\\u81ea\\u52a8\\u5237\\u65b0\\uff0c\\u8d85\\u9650\\u65f6\\u002030\\u0020\\u5206\\u949f\\u4e00\\u6b21"), ToolTipIcon.Info);
         }
 
         // =============== config ===============
@@ -563,6 +564,11 @@ namespace LiteLLMWidget
 
         void RefreshNow() { if (!busy) Poll(); }
 
+        void ApplyTimerInterval()
+        {
+            uiTimer.Interval = (overLimit ? OverLimitRefreshSeconds : Math.Max(10, refreshSeconds)) * 1000;
+        }
+
         async void Poll()
         {
             if (busy) return;
@@ -584,6 +590,7 @@ namespace LiteLLMWidget
             {
                 busy = false;
                 Render();
+                ApplyTimerInterval();
             }
         }
 
@@ -591,7 +598,10 @@ namespace LiteLLMWidget
         {
             HttpRequestMessage req = new HttpRequestMessage(HttpMethod.Post, baseUrl + "/chat/completions");
             req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
-            string json = "{\"model\":\"" + probeModel + "\",\"messages\":[],\"max_tokens\":1}";
+            // probe must SUCCEED: the gateway bans keys whose call failure rate exceeds
+            // 80%. The old empty-messages guaranteed-400 probe is retired (it made every
+            // poll a failed call); a valid 1-token "hi" costs ~2e-5 on a flash model.
+            string json = "{\"model\":\"" + probeModel + "\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":1}";
             ByteArrayContent content = new ByteArrayContent(Encoding.UTF8.GetBytes(json));
             content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
             req.Content = content;
