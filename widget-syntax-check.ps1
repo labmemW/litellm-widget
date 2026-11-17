@@ -29,7 +29,7 @@ Write-Output 'ps1 syntax OK'
 
 try {
   Add-Type -TypeDefinition $cs -ReferencedAssemblies @(
-    'System.dll','System.Core.dll','System.Drawing.dll','System.Windows.Forms.dll','System.Net.Http.dll') -OutputAssembly "$env:TEMP\litellm-widget-check.dll"
+    'System.dll','System.Core.dll','System.Drawing.dll','System.Windows.Forms.dll','System.Net.Http.dll','System.Management.dll') -OutputAssembly "$env:TEMP\litellm-widget-check.dll"
   Write-Output 'C# compile OK'
 } catch {
   Write-Output ('C# COMPILE FAILED: ' + $_.Exception.Message)

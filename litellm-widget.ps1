@@ -17,16 +17,20 @@ namespace LiteLLMWidget
 {
     using System;
     using System.Collections.Generic;
+    using System.Diagnostics;
     using System.Drawing;
     using System.Drawing.Drawing2D;
     using System.Globalization;
     using System.IO;
     using System.Linq;
+    using System.Management;
     using System.Net.Http;
     using System.Net.Http.Headers;
+    using System.Net.Sockets;
     using System.Runtime.InteropServices;
     using System.Text;
     using System.Text.RegularExpressions;
+    using System.Threading;
     using System.Threading.Tasks;
     using System.Windows.Forms;
 
@@ -55,6 +59,17 @@ namespace LiteLLMWidget
         double warnPct = 80.0, critPct = 95.0;
         double opacityVal = 0.85;
         string uiFontFamily = "Microsoft YaHei UI";
+
+        // ---- relay tunnel ----
+        // The proxy's LB pins clients by source IP to instances with separate spend ledgers;
+        // this desktop's egress lands on a stale one. Optional: forward probes through an
+        // ssh tunnel so egress happens from the relay host's IP. All values from config.ini.
+        bool relayEnabled = false;
+        string relaySshHost, relaySshUser, relayTarget, relayUrl;
+        int relaySshPort = 22, relayLocalPort = 18080;
+        Process tunnel;                    // our ssh child (null = not spawned by us)
+        DateTime lastSpawnAt = DateTime.MinValue;
+        const int SpawnThrottleSeconds = 30;
 
         // ---- ui ----
         Label lblTitle, lblStatus, lblMain, lblSub, lblPct;
@@ -95,6 +110,7 @@ namespace LiteLLMWidget
             cfgPath = Path.Combine(dir, "config.ini");
             posPath = Path.Combine(dir, "pos.txt");
             LoadConfig();
+            if (relayEnabled) KillOrphanTunnels();   // clear tunnels left by a crashed widget
             PickFont();
             BuildUi();
             BuildTray();
@@ -150,6 +166,25 @@ namespace LiteLLMWidget
             // where the whole file collapses into one line - otherwise it could swallow the api_key line)
             if (baseUrl != null && (baseUrl.IndexOf(' ') >= 0 || !baseUrl.StartsWith("http"))) baseUrl = null;
             if (apiKey != null && apiKey.Length == 0) apiKey = null;
+            // relay: optional ssh tunnel so probes egress from the relay host's IP
+            if (cfg.TryGetValue("relay_enabled", out v)) relayEnabled = (v == "1" || v == "true" || v == "True");
+            cfg.TryGetValue("relay_ssh_host", out relaySshHost);
+            cfg.TryGetValue("relay_ssh_user", out relaySshUser);
+            if (cfg.TryGetValue("relay_ssh_port", out v)) { int n; if (int.TryParse(v, out n) && n > 0) relaySshPort = n; }
+            if (cfg.TryGetValue("relay_local_port", out v)) { int n; if (int.TryParse(v, out n) && n > 0) relayLocalPort = n; }
+            if (cfg.TryGetValue("relay_target", out v) && v.Length > 0) relayTarget = v;
+            if (relayEnabled)
+            {
+                try
+                {
+                    if (relayTarget == null) { Uri u = new Uri(baseUrl); relayTarget = u.Host + ":" + u.Port; }
+                    UriBuilder ub = new UriBuilder(new Uri(baseUrl));
+                    ub.Host = "127.0.0.1"; ub.Port = relayLocalPort;
+                    relayUrl = ub.Uri.ToString().TrimEnd('/');
+                }
+                catch (Exception) { relayEnabled = false; }
+                if (relaySshHost == null || relaySshUser == null || relayTarget == null) relayEnabled = false;
+            }
         }
         static bool TryD(string s, out double d) { return double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out d); }
 
@@ -165,6 +200,12 @@ namespace LiteLLMWidget
                 sb.AppendLine("crit_pct=" + critPct);
                 sb.AppendLine("opacity=" + opacityVal.ToString("0.##", CultureInfo.InvariantCulture));
                 sb.AppendLine("probe_model=" + probeModel);
+                sb.AppendLine("relay_enabled=" + (relayEnabled ? "1" : "0"));
+                if (relaySshHost != null) sb.AppendLine("relay_ssh_host=" + relaySshHost);
+                if (relaySshUser != null) sb.AppendLine("relay_ssh_user=" + relaySshUser);
+                sb.AppendLine("relay_ssh_port=" + relaySshPort);
+                sb.AppendLine("relay_local_port=" + relayLocalPort);
+                if (relayTarget != null) sb.AppendLine("relay_target=" + relayTarget);
                 File.WriteAllText(cfgPath, sb.ToString());
             }
             catch (Exception) { }
@@ -553,6 +594,81 @@ namespace LiteLLMWidget
             }
         }
 
+        // =============== relay tunnel ===============
+        string TunnelSpec { get { return "127.0.0.1:" + relayLocalPort + ":" + relayTarget; } }
+
+        bool PortListening()
+        {
+            try
+            {
+                using (TcpClient c = new TcpClient())
+                {
+                    IAsyncResult ar = c.BeginConnect("127.0.0.1", relayLocalPort, null, null);
+                    if (!ar.AsyncWaitHandle.WaitOne(400)) return false;
+                    try { c.EndConnect(ar); return true; } catch (Exception) { return false; }
+                }
+            }
+            catch (Exception) { return false; }
+        }
+
+        void KillOrphanTunnels()
+        {
+            // kill any ssh holding OUR forward spec (spec is built from config at runtime,
+            // so nothing environment-specific lives in the source); a crashed widget can
+            // leave one behind holding the local port
+            try
+            {
+                string spec = "-L " + TunnelSpec;
+                foreach (ManagementObject mo in new ManagementObjectSearcher(
+                    "SELECT ProcessId, CommandLine FROM Win32_Process WHERE Name = 'ssh.exe'").Get())
+                {
+                    string cl = Convert.ToString(mo["CommandLine"]);
+                    if (cl != null && cl.IndexOf(spec, StringComparison.Ordinal) >= 0)
+                    {
+                        try { Process.GetProcessById(Convert.ToInt32(mo["ProcessId"])).Kill(); }
+                        catch (Exception) { }
+                    }
+                }
+            }
+            catch (Exception) { }
+            for (int i = 0; i < 15 && PortListening(); i++) Thread.Sleep(200);
+        }
+
+        bool EnsureTunnel()
+        {
+            if (PortListening()) return true;   // healthy - ours or reused from a previous run
+            if (tunnel != null)
+            {
+                try { if (!tunnel.HasExited) tunnel.Kill(); } catch (Exception) { }
+                tunnel = null;
+            }
+            if ((DateTime.Now - lastSpawnAt).TotalSeconds < SpawnThrottleSeconds) return false;
+            lastSpawnAt = DateTime.Now;
+            string args = "-N -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15" +
+                          " -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3" +
+                          " -p " + relaySshPort + " -L " + TunnelSpec + " " + relaySshUser + "@" + relaySshHost;
+            try { tunnel = StartHidden("ssh", args); }
+            catch (Exception) { try { tunnel = StartHidden(@"C:\Windows\System32\OpenSSH\ssh.exe", args); } catch (Exception) { return false; } }
+            for (int i = 0; i < 20 && !tunnel.HasExited && !PortListening(); i++) Thread.Sleep(300);
+            return PortListening();
+        }
+
+        static Process StartHidden(string exe, string arguments)
+        {
+            ProcessStartInfo pi = new ProcessStartInfo();
+            pi.FileName = exe;
+            pi.Arguments = arguments;
+            pi.UseShellExecute = false;
+            pi.CreateNoWindow = true;
+            return Process.Start(pi);
+        }
+
+        string ProbeBase()
+        {
+            if (relayEnabled && PortListening()) return relayUrl;
+            return baseUrl;
+        }
+
         // =============== polling ===============
         void InitHttp()
         {
@@ -596,7 +712,14 @@ namespace LiteLLMWidget
 
         async Task<bool> ProbeOnce()
         {
-            HttpRequestMessage req = new HttpRequestMessage(HttpMethod.Post, baseUrl + "/chat/completions");
+            string probeBase = baseUrl;
+            if (relayEnabled)
+            {
+                bool tun = await Task.Run((Func<bool>)EnsureTunnel);
+                if (tun) probeBase = relayUrl;
+                else errStatus = "relay tunnel down - probing direct";
+            }
+            HttpRequestMessage req = new HttpRequestMessage(HttpMethod.Post, probeBase + "/chat/completions");
             req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
             // probe must SUCCEED: the gateway bans keys whose call failure rate exceeds
             // 80%. The old empty-messages guaranteed-400 probe is retired (it made every
@@ -669,7 +792,7 @@ namespace LiteLLMWidget
         {
             try
             {
-                HttpRequestMessage req = new HttpRequestMessage(HttpMethod.Get, baseUrl + "/models");
+                HttpRequestMessage req = new HttpRequestMessage(HttpMethod.Get, ProbeBase() + "/models");
                 req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
                 HttpResponseMessage resp = await http.SendAsync(req);
                 string body = await resp.Content.ReadAsStringAsync();
@@ -791,7 +914,8 @@ namespace LiteLLMWidget
                     " | keyLen=" + (apiKey == null ? -1 : apiKey.Length) +
                     " | model=" + probeModel +
                     " | opacity=" + Opacity.ToString("0.##", CultureInfo.InvariantCulture) +
-                    " | dock=" + dockedEdge + (peeking ? "+peek" : ""));
+                    " | dock=" + dockedEdge + (peeking ? "+peek" : "") +
+                    " | relay=" + (relayEnabled ? (PortListening() ? "on" : "down") : "off"));
             }
             catch (Exception) { }
         }
@@ -799,6 +923,7 @@ namespace LiteLLMWidget
         void ExitApp()
         {
             SavePos();
+            if (tunnel != null) { try { if (!tunnel.HasExited) tunnel.Kill(); } catch (Exception) { } }
             try { tray.Visible = false; tray.Dispose(); } catch (Exception) { }
             Application.Exit();
         }
@@ -808,7 +933,7 @@ namespace LiteLLMWidget
 
 Add-Type -TypeDefinition $source -ReferencedAssemblies @(
     'System.dll', 'System.Core.dll', 'System.Drawing.dll',
-    'System.Windows.Forms.dll', 'System.Net.Http.dll'
+    'System.Windows.Forms.dll', 'System.Net.Http.dll', 'System.Management.dll'
 )
 
 [System.Windows.Forms.Application]::EnableVisualStyles()

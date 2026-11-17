@@ -47,6 +47,16 @@
 - 探测是合法最小请求("hi" + max_tokens=1,约 ¥0.00002/次,last-state 里 spend 可见非零):
   2026-10 起网关按失败率封 key(超 80% 封禁),旧"空 messages 必 400"零成本探测每天制造
   ~1440 次失败调用,经用户决定弃用——不要改回零成本探测
+- **中继模式(2026-11-17 加入)**:代理的 LB 按来源 IP 钉实例、各实例 spend 账本不同步,
+  本机出口曾被钉在只记 widget 自身探测(≈¥0.003)且冻结的账本上,而真实消费走其它出口
+  (实测同 key 同一分钟:本机出口 0.0029 冻结,另一台机器出口 2.71 实时;经中继机转发后
+  立即读到实时值)。配置键:relay_enabled/relay_ssh_host/relay_ssh_port/relay_ssh_user/
+  relay_local_port/relay_target(缺省从 base_url 解析 host:port)。行为:启动时按
+  "命令行含 `-L 127.0.0.1:<port>:<target>`"杀孤儿隧道(WMI,规格串运行时由 config 拼出,
+  源码无环境信息);探测前确保隧道在,死了重拉(30 秒节流);拉不起来回落直连并把
+  errStatus 置为 "relay tunnel down - probing direct";退出时杀自己的子进程。
+  last-state 的 `relay=on/down/off` 看状态。C# 依赖 System.Management.dll(本体和
+  widget-syntax-check.ps1 的 ReferencedAssemblies 都要带)
 - 超预算后轮询退避为 30 分钟一次(OverLimitRefreshSeconds 常量);429 响应体解析额度路径不变
 - 超限时 LiteLLM 返回 429,响应体含 "Current cost: X, Max budget: Y",widget 会解析
 - 额度重置通常靠管理员手动或 budget_duration 自动(看部署),没有通用查询接口;
