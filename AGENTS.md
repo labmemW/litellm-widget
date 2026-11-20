@@ -9,7 +9,11 @@
 - **运行时(用户的 Windows 桌面)**:`~/.litellm-widget/` 下:
   litellm-widget.ps1(本体)、config.ini(**含多把 key**,`api_keys=` 逗号分隔;
   旧 `api_key=` 单 key 格式仍兼容)、start-widget.vbs(静默启动)、
-  pos.txt(位置记忆)、last-state.txt(每轮脱敏诊断)
+  pos.txt(位置记忆)、last-state.txt(每轮脱敏诊断)、
+  push-keys.ps1 + push-merge.sh(把 api_keys 分发到 21/27 的 key 池;含机器信息,不入库)
+- **key 池(21/27 服务器)**:每台一个本地 LiteLLM(127.0.0.1:8081)消费这些 key,
+  429 自动冷却切换;`api_keys` 改动经 push-keys.ps1 生效,详见服务器上的
+  `~/.agents/skills/litellm/SKILL.md`。widget 只是监控方,不经过池
 - **数据源(LiteLLM 代理)**:地址和 key 都在 config.ini 里,不要把真实值写进仓库;
   用量来自响应头 `x-litellm-key-spend` / `x-litellm-key-max-budget`
 - 服务器与 Windows 之间用 scp 同步(端口/地址看用户环境),没有 CI;

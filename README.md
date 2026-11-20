@@ -93,6 +93,22 @@ powershell -File install-autostart.ps1                          # 注册开机�
 
 - 额度重置若是管理员手动操作,则无自动重置时间可查(部分部署的 /key/info 不开放);
   重置后悬浮窗在下个刷新周期自动恢复,提醒重新武装
-- key 通常有 RPM 限制,悬浮窗每轮询一次占 1 次
+- key 通常有 RPM 限制,悬浮窗每轮对每把 key 各占 1 次
 - 集群部署下限额检查本身也有透支空间(各实例账本同步滞后,消费前校验各自为政),
   显示的是修正后的最大值,但真实消费仍可能略超限额——想稳妥就给提醒阈值留余量
+
+## key 池分发(与 21/27 服务器联动)
+
+widget 的 config.ini 是**多 key 的唯一事实源**,消费侧在两台 Linux 服务器上各跑一个
+本地 LiteLLM key 池(kimi/工具经 `127.0.0.1:8081` 消费,429 自动冷却切换)。改完
+config.ini 的 `api_keys=` 后跑分发脚本,把 key 推到两台机器并重启各自的池:
+
+```powershell
+powershell -File %USERPROFILE%\.litellm-widget\push-keys.ps1   # 默认推 27+21
+```
+
+- 脚本与 `push-merge.sh` 都在 `~/.litellm-widget/`(含内部机器信息,**不入库**);
+  远端池的文件与运维见两台机器上的 `~/.agents/skills/litellm/SKILL.md`
+- **key 彻底超限后要从 `api_keys=` 摘除再推一次**:池对冷却中的 key 每小时试探一次,
+  上游网关按失败率(>80%)封 key,死 key 留在池里有封禁风险;管理员重置后再加回来
+- 加 key 流程:改 config.ini(走 .ps1 脚本,勿 shell 内联)→ 重启 widget → push-keys
