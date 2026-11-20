@@ -17,7 +17,10 @@ PowerShell(WinForms),零依赖。
 
 - 数据源:代理(chat/completions)响应头 `x-litellm-key-spend` / `x-litellm-key-max-budget`
 - **多 key**:config.ini `api_keys=k1,k2,...` 逗号分隔(`api_key=` 单 key 旧格式仍兼容);
-  每轮对每把 key 各发一次最小探测,合计 = Σspend / Σbudget / Σ剩余(超限 key 剩余计 0)
+  每轮只探测一把 key(轮转错峰,取最久未探的)——.NET Framework 下带 ConnectionClose 的
+  背靠背请求会撞 socket 回收竞态,错峰后每把 key 的刷新间隔 = refresh_seconds × key 数
+  (3 key/60s 即每把 3 分钟,仍远快于超限退避的 30 分钟);
+  合计 = Σspend / Σbudget / Σ剩余(超限 key 剩余计 0)
 - **合法最小探测**:发一条真实请求(`"hi"` + `max_tokens=1`,约 ¥0.00002/次,flash 模型),
   从响应头读用量。旧版的零成本探测(空 messages 必 400)会让每次轮询都计一次失败调用,
   网关按失败率封 key(超 80% 封禁),已弃用

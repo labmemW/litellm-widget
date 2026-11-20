@@ -789,23 +789,35 @@ namespace LiteLLMWidget
                 errStatus = null;
                 DateTime now = DateTime.Now;
                 bool anyTried = false, anyOk = false;
+                // probe ONE key per cycle, the oldest due one: probes set ConnectionClose
+                // (LB instance re-roll) and back-to-back requests to the same host hit the
+                // socket-teardown race on .NET Framework. Spreading keys across cycles
+                // removes the race entirely; each key refreshes every refreshSeconds*N
+                // (still far below the 30-min over-limit backoff).
+                KeyState pick = null;
                 foreach (KeyState ks in keys)
                 {
                     if (!ks.Due(Math.Max(10, refreshSeconds), OverLimitRefreshSeconds)) continue;
+                    if (pick == null || ks.lastProbeAt < pick.lastProbeAt) pick = ks;
+                }
+                if (pick != null)
+                {
                     anyTried = true;
-                    ks.lastProbeAt = now;
-                    bool ok = await ProbeOnce(ks);
-                    if (ok) { anyOk = true; ks.err = null; ks.failCount = 0; }
+                    pick.lastProbeAt = now;
+                    bool ok = false;
+                    try { ok = await ProbeOnce(pick); }
+                    catch (Exception ex) { pick.err = ex.GetType().Name + ": " + ex.Message; }
+                    if (ok) { anyOk = true; pick.err = null; pick.failCount = 0; }
                     else
                     {
-                        ks.failCount++;
+                        pick.failCount++;
                         // repeated failure: probe model may be gone (403, no headers) - relearn
-                        if (ks.failCount == 2) await RelearnModel(ks);
+                        if (pick.failCount == 2) await RelearnModel(pick);
                     }
                 }
                 if (anyTried && !anyOk) errStatus = LastKeyErr();
             }
-            catch (Exception ex) { errStatus = ex.Message; }
+            catch (Exception ex) { errStatus = ex.GetType().Name + ": " + ex.Message; }
             finally
             {
                 busy = false;

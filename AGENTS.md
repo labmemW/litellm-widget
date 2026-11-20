@@ -51,8 +51,10 @@
 ## 有用的事实
 
 - **多 key(2026-11-20 加入)**:config.ini `api_keys=k1,k2,...` 逗号分隔,可选
-  `key_names=名1,名2` 显示名(默认 k1,k2);每轮对每把 key 各探测一次,合计与明细
-  分开展示;超限 key **各自**退避 30 分钟(429 也计入该 key 失败率,网关超 80% 封禁),
+  `key_names=名1,名2` 显示名(默认 k1,k2);**每轮只探一把 key(最久未探的,轮转)**,
+  合计与明细分开展示——不要改回"一轮连发全部 key":.NET Framework 下带 ConnectionClose
+  的背靠背请求会撞 socket 回收竞态,表现为从第二把 key 起随机失败(曾致 failCount 反复=1
+  且无错误信息);超限 key **各自**退避 30 分钟(429 也计入该 key 失败率,网关超 80% 封禁),
   健康 key 不受影响;last-state 的 keys/ 段用稳定索引 k0,k1(key_names 可能非 ASCII);
   改 key 清单 = 改 config.ini 的 api_keys 行(走 .ps1 脚本,规则 4)后重启
 - 探测是合法最小请求("hi" + max_tokens=1,约 ¥0.00002/次,last-state 里 spend 可见非零):
