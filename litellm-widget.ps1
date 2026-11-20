@@ -255,22 +255,32 @@ namespace LiteLLMWidget
         {
             try
             {
-                StringBuilder sb = new StringBuilder();
-                sb.AppendLine("base_url=" + baseUrl);
-                sb.AppendLine("api_keys=" + string.Join(",", apiKeys.ToArray()));
-                if (keyNames.Count > 0) sb.AppendLine("key_names=" + string.Join(",", keyNames.ToArray()));
-                sb.AppendLine("refresh_seconds=" + refreshSeconds);
-                sb.AppendLine("warn_pct=" + warnPct);
-                sb.AppendLine("crit_pct=" + critPct);
-                sb.AppendLine("opacity=" + opacityVal.ToString("0.##", CultureInfo.InvariantCulture));
-                sb.AppendLine("probe_model=" + probeModel);
-                sb.AppendLine("relay_enabled=" + (relayEnabled ? "1" : "0"));
-                if (relaySshHost != null) sb.AppendLine("relay_ssh_host=" + relaySshHost);
-                if (relaySshUser != null) sb.AppendLine("relay_ssh_user=" + relaySshUser);
-                sb.AppendLine("relay_ssh_port=" + relaySshPort);
-                sb.AppendLine("relay_local_port=" + relayLocalPort);
-                if (relayTarget != null) sb.AppendLine("relay_target=" + relayTarget);
-                File.WriteAllText(cfgPath, sb.ToString());
+                // write-through of ONLY the two fields the widget itself changes
+                // (wheel opacity, model relearn). The whole-file rewrite we used
+                // before silently reverted hand edits to api_keys/key_names made
+                // while the widget was running. Unknown/comment lines are kept.
+                List<string> lines = new List<string>();
+                try { foreach (string l in File.ReadAllLines(cfgPath)) lines.Add(l); }
+                catch (Exception) { }
+                bool opDone = false, modelDone = false;
+                for (int i = 0; i < lines.Count; i++)
+                {
+                    string t = lines[i].TrimStart();
+                    if (t.StartsWith("#") || t.StartsWith(";")) continue;
+                    if (t.StartsWith("opacity"))
+                    {
+                        lines[i] = "opacity=" + opacityVal.ToString("0.##", CultureInfo.InvariantCulture);
+                        opDone = true;
+                    }
+                    else if (t.StartsWith("probe_model"))
+                    {
+                        lines[i] = "probe_model=" + probeModel;
+                        modelDone = true;
+                    }
+                }
+                if (!opDone) lines.Add("opacity=" + opacityVal.ToString("0.##", CultureInfo.InvariantCulture));
+                if (!modelDone) lines.Add("probe_model=" + probeModel);
+                File.WriteAllLines(cfgPath, lines.ToArray());
             }
             catch (Exception) { }
         }
