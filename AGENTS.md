@@ -6,8 +6,9 @@
 ## 运行拓扑(先搞清东西在哪)
 
 - **本仓(Linux 服务器)**:源码存档,**不在这台机器上运行**
-- **运行时(用户的 Windows 桌面)**:`~/.litellm-widget/` 下 5 个文件:
-  litellm-widget.ps1(本体)、config.ini(**含 key**)、start-widget.vbs(静默启动)、
+- **运行时(用户的 Windows 桌面)**:`~/.litellm-widget/` 下:
+  litellm-widget.ps1(本体)、config.ini(**含多把 key**,`api_keys=` 逗号分隔;
+  旧 `api_key=` 单 key 格式仍兼容)、start-widget.vbs(静默启动)、
   pos.txt(位置记忆)、last-state.txt(每轮脱敏诊断)
 - **数据源(LiteLLM 代理)**:地址和 key 都在 config.ini 里,不要把真实值写进仓库;
   用量来自响应头 `x-litellm-key-spend` / `x-litellm-key-max-budget`
@@ -34,16 +35,22 @@
 
 1. 改 Windows 上 `~/.litellm-widget/litellm-widget.ps1`(活副本)
 2. 跑 widget-syntax-check.ps1,三项全过
-3. 重启:按规则 5 杀旧 powershell 实例,`wscript %USERPROFILE%\.litellm-widget\start-widget.vbs` 启动
+3. 重启:跑 `restart-widget.ps1`(按规则 5 杀旧实例并 VBS 重启)
 4. **验证只看 last-state.txt**(30~90 秒内会刷新,可直接 cat,已脱敏):
-   - 健康:`err=-  failCount=0  baseUrl=OK  keyLen>0  spend>=0`
+   - 健康:`err=-  failCount=0  baseUrl=OK  keys=k0:spend/budget,...  total=x/y  keyLen=k0:25`
    - `err=HTTP 403`:探测模型下线,failCount 到 2 会自动 RelearnModel 自愈,等一轮
-   - `err=HTTP 429 且 spend 有值`:已超限,走 429 响应体解析,属正常路径
+   - `err=HTTP 429 且 keys 有值`:该 key 已超限,走 429 响应体解析,属正常路径
+     (状态行里该 key 显示为 `k0:x/y/over`;只有全部 key 超限才会整体退避 30 分钟)
    - `baseUrl=INVALID / keyLen=-1`:config.ini 损坏,跑 widget-fix-config.ps1
 5. 验证通过后归档:scp 回服务器的仓目录,git add 具体文件名,commit
 
 ## 有用的事实
 
+- **多 key(2026-11-20 加入)**:config.ini `api_keys=k1,k2,...` 逗号分隔,可选
+  `key_names=名1,名2` 显示名(默认 k1,k2);每轮对每把 key 各探测一次,合计与明细
+  分开展示;超限 key **各自**退避 30 分钟(429 也计入该 key 失败率,网关超 80% 封禁),
+  健康 key 不受影响;last-state 的 keys/ 段用稳定索引 k0,k1(key_names 可能非 ASCII);
+  改 key 清单 = 改 config.ini 的 api_keys 行(走 .ps1 脚本,规则 4)后重启
 - 探测是合法最小请求("hi" + max_tokens=1,约 ¥0.00002/次,last-state 里 spend 可见非零):
   2026-10 起网关按失败率封 key(超 80% 封禁),旧"空 messages 必 400"零成本探测每天制造
   ~1440 次失败调用,经用户决定弃用——不要改回零成本探测

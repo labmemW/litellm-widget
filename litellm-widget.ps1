@@ -53,8 +53,11 @@ namespace LiteLLMWidget
         static string S(string u) { return Regex.Unescape(u); } // runtime \uXXXX -> real chars
 
         // ---- config ----
-        string baseUrl, apiKey, probeModel, cfgPath, posPath;
+        string baseUrl, probeModel, cfgPath, posPath;
+        List<string> apiKeys = new List<string>();
+        List<string> keyNames = new List<string>();
         int refreshSeconds = 60;
+        const int MaxKeyRows = 8;                  // per-key lines drawn in the body; extras fold into "+N more"
         const int OverLimitRefreshSeconds = 1800;  // over budget: 429s also count as failed calls, back off to 30 min
         double warnPct = 80.0, critPct = 95.0;
         double opacityVal = 0.85;
@@ -73,6 +76,7 @@ namespace LiteLLMWidget
 
         // ---- ui ----
         Label lblTitle, lblStatus, lblMain, lblSub, lblPct;
+        List<Label> keyRowLabels = new List<Label>();   // one mini status line per key
         Panel barTrack, barFill;
         NotifyIcon tray;
         ContextMenuStrip menu;
@@ -81,16 +85,53 @@ namespace LiteLLMWidget
 
         // ---- state ----
         HttpClient http;
-        double spend = -1, budget = -1;
-        DateTime lastOk = DateTime.MinValue;
-        bool busy = false, warnShown = false, critShown = false, overLimit = false, initDone = false;
+        List<KeyState> keys = new List<KeyState>();
+        DateTime lastOk = DateTime.MinValue;       // newest successful probe across all keys
+        bool busy = false, initDone = false;
+        bool totalCritShown = false;
         string errStatus = null;
-        int failCount = 0;
-        // multi-instance jitter: the proxy is an ELB-fronted cluster whose instances serve
-        // stale spend values; display the MAX seen within a window so it never jumps backwards
-        double[] spendHist = new double[10];
-        DateTime[] spendHistAt = new DateTime[10];
-        int spendHistIdx = 0;
+
+        // per-key probe state. Multi-instance jitter fix lives here too: the proxy is an
+        // ELB-fronted cluster whose instances serve stale spend values, so each key shows
+        // the MAX seen within a 15-minute window and never jumps backwards.
+        class KeyState
+        {
+            public string key, name;
+            public double spend = -1, budget = -1;
+            public double[] spendHist = new double[10];
+            public DateTime[] spendHistAt = new DateTime[10];
+            public int spendHistIdx = 0;
+            public int failCount = 0;
+            public bool overLimit = false, warnShown = false, critShown = false;
+            public DateTime lastOk = DateTime.MinValue, lastProbeAt = DateTime.MinValue;
+            public string err = null;
+            // an over-limit key backs off to 30 min (429s count as failed calls at the
+            // gateway and can get the key banned); healthy keys keep the normal cadence
+            public bool Due(int normalSec, int overSec)
+            {
+                int interval = overLimit ? overSec : normalSec;
+                return (DateTime.Now - lastProbeAt).TotalSeconds >= interval;
+            }
+        }
+
+        bool AllOverLimit()
+        {
+            if (keys.Count == 0) return false;
+            foreach (KeyState ks in keys) if (!ks.overLimit) return false;
+            return true;
+        }
+
+        // aggregate across keys that have produced numbers at least once
+        void Totals(out double spend, out double budget, out int okKeys, out int overKeys)
+        {
+            spend = 0; budget = 0; okKeys = 0; overKeys = 0;
+            foreach (KeyState ks in keys)
+                if (ks.spend >= 0 && ks.budget > 0)
+                {
+                    spend += ks.spend; budget += ks.budget; okKeys++;
+                    if (ks.overLimit) overKeys++;
+                }
+        }
 
         // ---- edge dock / auto-hide ----
         enum Edge { None, Left, Right }
@@ -110,6 +151,7 @@ namespace LiteLLMWidget
             cfgPath = Path.Combine(dir, "config.ini");
             posPath = Path.Combine(dir, "pos.txt");
             LoadConfig();
+            if (keys.Count == 0) errStatus = "no usable api_keys in config.ini";
             if (relayEnabled) KillOrphanTunnels();   // clear tunnels left by a crashed widget
             PickFont();
             BuildUi();
@@ -155,7 +197,24 @@ namespace LiteLLMWidget
             }
             catch (Exception) { }
             cfg.TryGetValue("base_url", out baseUrl);
-            cfg.TryGetValue("api_key", out apiKey);
+            // multi-key: api_keys=k1,k2,... (comma separated); legacy single api_key still accepted
+            string keysLine = null;
+            cfg.TryGetValue("api_keys", out keysLine);
+            if (keysLine != null)
+                foreach (string k in keysLine.Split(','))
+                {
+                    string t = k.Trim();
+                    if (t.Length > 0) apiKeys.Add(t);   // drop empties (guards against corrupted config)
+                }
+            if (apiKeys.Count == 0)
+            {
+                string legacy; cfg.TryGetValue("api_key", out legacy);
+                if (legacy != null && legacy.Length > 0) apiKeys.Add(legacy);
+            }
+            string namesLine = null;
+            cfg.TryGetValue("key_names", out namesLine);
+            if (namesLine != null)
+                foreach (string n in namesLine.Split(',')) { string t = n.Trim(); if (t.Length > 0) keyNames.Add(t); }
             string v;
             if (cfg.TryGetValue("refresh_seconds", out v)) { int n; if (int.TryParse(v, out n) && n >= 10) refreshSeconds = n; }
             if (cfg.TryGetValue("warn_pct", out v)) { double d; if (TryD(v, out d)) warnPct = d; }
@@ -163,9 +222,8 @@ namespace LiteLLMWidget
             if (cfg.TryGetValue("opacity", out v)) { double d; if (TryD(v, out d) && d >= 0.30 && d <= 1.0) opacityVal = d; }
             if (cfg.TryGetValue("probe_model", out v) && v.Length > 0) probeModel = v; else probeModel = "Qwen3.8-Flash";
             // sanity: base_url must be a clean http(s) URL with no spaces (guards against corrupted config
-            // where the whole file collapses into one line - otherwise it could swallow the api_key line)
+            // where the whole file collapses into one line - otherwise it could swallow the api_keys line)
             if (baseUrl != null && (baseUrl.IndexOf(' ') >= 0 || !baseUrl.StartsWith("http"))) baseUrl = null;
-            if (apiKey != null && apiKey.Length == 0) apiKey = null;
             // relay: optional ssh tunnel so probes egress from the relay host's IP
             if (cfg.TryGetValue("relay_enabled", out v)) relayEnabled = (v == "1" || v == "true" || v == "True");
             cfg.TryGetValue("relay_ssh_host", out relaySshHost);
@@ -185,6 +243,11 @@ namespace LiteLLMWidget
                 catch (Exception) { relayEnabled = false; }
                 if (relaySshHost == null || relaySshUser == null || relayTarget == null) relayEnabled = false;
             }
+            // materialize per-key state; names default to k1,k2,... (state file uses indexes,
+            // names may be non-ASCII - only the UI renders them)
+            keys.Clear();
+            for (int i = 0; i < apiKeys.Count; i++)
+                keys.Add(new KeyState { key = apiKeys[i], name = (i < keyNames.Count ? keyNames[i] : "k" + (i + 1)) });
         }
         static bool TryD(string s, out double d) { return double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out d); }
 
@@ -194,7 +257,8 @@ namespace LiteLLMWidget
             {
                 StringBuilder sb = new StringBuilder();
                 sb.AppendLine("base_url=" + baseUrl);
-                sb.AppendLine("api_key=" + apiKey);
+                sb.AppendLine("api_keys=" + string.Join(",", apiKeys.ToArray()));
+                if (keyNames.Count > 0) sb.AppendLine("key_names=" + string.Join(",", keyNames.ToArray()));
                 sb.AppendLine("refresh_seconds=" + refreshSeconds);
                 sb.AppendLine("warn_pct=" + warnPct);
                 sb.AppendLine("crit_pct=" + critPct);
@@ -224,7 +288,9 @@ namespace LiteLLMWidget
             TopMost = true;
             ShowInTaskbar = false;
             StartPosition = FormStartPosition.Manual;
-            Size = new Size(252, 106);
+            // base layout occupies the top 96px; one 17px mini line per key below it
+            int rows = Math.Min(keys.Count, MaxKeyRows);
+            Size = new Size(252, rows > 0 ? 96 + 17 * rows + 8 : 106);
             BackColor = Color.FromArgb(30, 30, 34);
             Font = new Font(uiFontFamily, 9F);
             Opacity = opacityVal;
@@ -277,12 +343,28 @@ namespace LiteLLMWidget
             lblSub.Location = new Point(14, 78);
             lblSub.AutoSize = true;
 
+            // per-key mini status lines under the aggregate block (Render fills the text;
+            // when keys exceed MaxKeyRows the last line becomes "+N more")
+            int rowY = 96;
+            for (int i = 0; i < rows; i++)
+            {
+                Label lr = new Label();
+                lr.Text = S("\\u2026");
+                lr.ForeColor = Color.FromArgb(150, 150, 158);
+                lr.Font = new Font(uiFontFamily, 8F);
+                lr.Location = new Point(14, rowY);
+                lr.Size = new Size(224, 15);
+                keyRowLabels.Add(lr);
+                rowY += 17;
+            }
+
             Controls.Add(lblTitle);
             Controls.Add(lblStatus);
             Controls.Add(lblMain);
             Controls.Add(lblPct);
             Controls.Add(barTrack);
             Controls.Add(lblSub);
+            foreach (Label lr in keyRowLabels) Controls.Add(lr);
 
             toolTip = new ToolTip();
 
@@ -531,9 +613,20 @@ namespace LiteLLMWidget
 
         Color LevelColor()
         {
+            double spend, budget; int okKeys, overKeys;
+            Totals(out spend, out budget, out okKeys, out overKeys);
             if (budget <= 0 || spend < 0) return Color.FromArgb(120, 120, 128);
             double pct = spend / budget * 100.0;
-            if (overLimit || pct >= critPct) return Color.FromArgb(244, 67, 54);
+            if ((okKeys > 0 && overKeys == okKeys) || pct >= critPct) return Color.FromArgb(244, 67, 54);
+            if (pct >= warnPct) return Color.FromArgb(255, 152, 0);
+            return Color.FromArgb(76, 175, 80);
+        }
+
+        Color KeyLevelColor(KeyState ks)
+        {
+            if (ks.budget <= 0 || ks.spend < 0) return Color.FromArgb(120, 120, 128);
+            double pct = ks.spend / ks.budget * 100.0;
+            if (ks.overLimit || pct >= critPct) return Color.FromArgb(244, 67, 54);
             if (pct >= warnPct) return Color.FromArgb(255, 152, 0);
             return Color.FromArgb(76, 175, 80);
         }
@@ -542,6 +635,8 @@ namespace LiteLLMWidget
         // which works under occlusion / WM_PRINTCLIENT where Paint events do not fire)
         void PaintBar()
         {
+            double spend, budget; int okKeys, overKeys;
+            Totals(out spend, out budget, out okKeys, out overKeys);
             double p = (budget > 0 && spend >= 0) ? Math.Min(spend / budget, 1.0) : 0.0;
             int w = (int)Math.Round((barTrack.Width - 4) * p);
             if (w < 2) w = 0; else if (w > barTrack.Width - 4) w = barTrack.Width - 4;
@@ -682,7 +777,7 @@ namespace LiteLLMWidget
 
         void ApplyTimerInterval()
         {
-            uiTimer.Interval = (overLimit ? OverLimitRefreshSeconds : Math.Max(10, refreshSeconds)) * 1000;
+            uiTimer.Interval = (AllOverLimit() ? OverLimitRefreshSeconds : Math.Max(10, refreshSeconds)) * 1000;
         }
 
         async void Poll()
@@ -692,14 +787,23 @@ namespace LiteLLMWidget
             try
             {
                 errStatus = null;
-                bool ok = await ProbeOnce();
-                if (!ok)
+                DateTime now = DateTime.Now;
+                bool anyTried = false, anyOk = false;
+                foreach (KeyState ks in keys)
                 {
-                    failCount++;
-                    // repeated failure: probe model may be gone (403, no headers) - relearn
-                    if (failCount == 2) await RelearnModel();
+                    if (!ks.Due(Math.Max(10, refreshSeconds), OverLimitRefreshSeconds)) continue;
+                    anyTried = true;
+                    ks.lastProbeAt = now;
+                    bool ok = await ProbeOnce(ks);
+                    if (ok) { anyOk = true; ks.err = null; ks.failCount = 0; }
+                    else
+                    {
+                        ks.failCount++;
+                        // repeated failure: probe model may be gone (403, no headers) - relearn
+                        if (ks.failCount == 2) await RelearnModel(ks);
+                    }
                 }
-                else failCount = 0;
+                if (anyTried && !anyOk) errStatus = LastKeyErr();
             }
             catch (Exception ex) { errStatus = ex.Message; }
             finally
@@ -710,7 +814,13 @@ namespace LiteLLMWidget
             }
         }
 
-        async Task<bool> ProbeOnce()
+        string LastKeyErr()
+        {
+            foreach (KeyState ks in keys) if (ks.err != null) return ks.err;
+            return "probe failed";
+        }
+
+        async Task<bool> ProbeOnce(KeyState ks)
         {
             string probeBase = baseUrl;
             if (relayEnabled)
@@ -720,7 +830,7 @@ namespace LiteLLMWidget
                 else errStatus = "relay tunnel down - probing direct";
             }
             HttpRequestMessage req = new HttpRequestMessage(HttpMethod.Post, probeBase + "/chat/completions");
-            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+            req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", ks.key);
             // probe must SUCCEED: the gateway bans keys whose call failure rate exceeds
             // 80%. The old empty-messages guaranteed-400 probe is retired (it made every
             // poll a failed call); a valid 1-token "hi" costs ~2e-5 on a flash model.
@@ -747,31 +857,33 @@ namespace LiteLLMWidget
                 if (ms.Success && mb.Success) { s = ms.Groups[1].Value; b = mb.Groups[1].Value; }
                 else
                 {
-                    errStatus = "HTTP " + (int)resp.StatusCode + ": " + Trunc(body, 150);
+                    ks.err = "HTTP " + (int)resp.StatusCode + ": " + Trunc(body, 150);
                     return false;
                 }
             }
             double newSpend, newBudget;
-            if (!TryD(s, out newSpend) || !TryD(b, out newBudget)) { errStatus = "cannot parse: " + s + " / " + b; return false; }
-            budget = newBudget;
-            spend = MaxSpend(newSpend);   // jitter fix: cluster instances serve stale values
-            lastOk = DateTime.Now;
-            CheckThresholds();
+            if (!TryD(s, out newSpend) || !TryD(b, out newBudget)) { ks.err = "cannot parse: " + s + " / " + b; return false; }
+            ks.budget = newBudget;
+            ks.spend = MaxSpend(ks, newSpend);   // jitter fix: cluster instances serve stale values
+            ks.overLimit = ks.spend >= ks.budget;
+            ks.lastOk = DateTime.Now;
+            if (ks.lastOk > lastOk) lastOk = ks.lastOk;
+            CheckThresholds(ks);
             return true;
         }
 
-        double MaxSpend(double fresh)
+        double MaxSpend(KeyState ks, double fresh)
         {
             DateTime now = DateTime.Now;
-            spendHist[spendHistIdx] = fresh;
-            spendHistAt[spendHistIdx] = now;
-            spendHistIdx = (spendHistIdx + 1) % spendHist.Length;
+            ks.spendHist[ks.spendHistIdx] = fresh;
+            ks.spendHistAt[ks.spendHistIdx] = now;
+            ks.spendHistIdx = (ks.spendHistIdx + 1) % ks.spendHist.Length;
             // window: keep samples from the last 15 minutes; max of them is the best guess
             // at the real total. A genuine admin reset (all servers drop) ages out naturally.
             double max = -1;
-            for (int i = 0; i < spendHist.Length; i++)
+            for (int i = 0; i < ks.spendHist.Length; i++)
             {
-                if ((now - spendHistAt[i]).TotalMinutes <= 15 && spendHist[i] > max) max = spendHist[i];
+                if ((now - ks.spendHistAt[i]).TotalMinutes <= 15 && ks.spendHist[i] > max) max = ks.spendHist[i];
             }
             if (max < 0) max = fresh;
             return max;
@@ -788,12 +900,12 @@ namespace LiteLLMWidget
             return null;
         }
 
-        async Task RelearnModel()
+        async Task RelearnModel(KeyState ks)
         {
             try
             {
                 HttpRequestMessage req = new HttpRequestMessage(HttpMethod.Get, ProbeBase() + "/models");
-                req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", apiKey);
+                req.Headers.Authorization = new AuthenticationHeaderValue("Bearer", keys.Count > 0 ? keys[0].key : "");
                 HttpResponseMessage resp = await http.SendAsync(req);
                 string body = await resp.Content.ReadAsStringAsync();
                 List<string> ids = Regex.Matches(body, "\"id\"\\s*:\\s*\"([^\"]+)\"")
@@ -810,30 +922,47 @@ namespace LiteLLMWidget
                 {
                     probeModel = pick;
                     SaveConfig();
-                    await ProbeOnce();
+                    if (await ProbeOnce(ks)) ks.failCount = 0;
                 }
             }
             catch (Exception) { }
         }
 
-        void CheckThresholds()
+        void CheckThresholds(KeyState ks)
         {
-            if (budget <= 0 || spend < 0) return;
-            double pct = spend / budget * 100.0;
-            string info = S("\\u5df2\\u7528\\u0020") + pct.ToString("0.#", CultureInfo.InvariantCulture) + S("\\u0025\\uff08\\u00a5") +
-                          spend.ToString("0.##", CultureInfo.InvariantCulture) + S("\\u0020\\u002f\\u0020\\u00a5") +
-                          budget.ToString("0.#", CultureInfo.InvariantCulture) + S("\\u0029");
-            if (pct >= critPct && !critShown)
+            if (ks.budget <= 0 || ks.spend < 0) return;
+            double pct = ks.spend / ks.budget * 100.0;
+            string info = ks.name + S("\\u0020\\u5df2\\u7528\\u0020") + pct.ToString("0.#", CultureInfo.InvariantCulture) + S("\\u0025\\uff08\\u00a5") +
+                          ks.spend.ToString("0.##", CultureInfo.InvariantCulture) + S("\\u0020\\u002f\\u0020\\u00a5") +
+                          ks.budget.ToString("0.#", CultureInfo.InvariantCulture) + S("\\uff09");
+            if (pct >= critPct && !ks.critShown)
             {
-                critShown = true; warnShown = true;
+                ks.critShown = true; ks.warnShown = true;
                 tray.ShowBalloonTip(8000, S("\\u004c\\u0069\\u0074\\u0065\\u004c\\u004c\\u004d\\u0020\\u989d\\u5ea6\\u544a\\u6025"), info, ToolTipIcon.Warning);
             }
-            else if (pct >= warnPct && !warnShown)
+            else if (pct >= warnPct && !ks.warnShown)
             {
-                warnShown = true;
+                ks.warnShown = true;
                 tray.ShowBalloonTip(6000, S("\\u004c\\u0069\\u0074\\u0065\\u004c\\u004c\\u004d\\u0020\\u989d\\u5ea6\\u63d0\\u9192"), info, ToolTipIcon.Info);
             }
-            if (pct < warnPct - 5) { warnShown = false; critShown = false; } // re-arm after admin reset
+            if (pct < warnPct - 5) { ks.warnShown = false; ks.critShown = false; } // re-arm after admin reset
+        }
+
+        // one aggregate-level crit balloon on top of the per-key ones (warn stays per-key
+        // to avoid noise; totals flip red only when the WHOLE pool is nearly drained)
+        void CheckTotalThresholds(double totSpend, double totBudget)
+        {
+            if (totBudget <= 0 || totSpend < 0) return;
+            double pct = totSpend / totBudget * 100.0;
+            string info = S("\\u603b\\u8ba1\\u5df2\\u7528\\u0020") + pct.ToString("0.#", CultureInfo.InvariantCulture) + S("\\u0025\\uff08\\u00a5") +
+                          totSpend.ToString("0.##", CultureInfo.InvariantCulture) + S("\\u0020\\u002f\\u0020\\u00a5") +
+                          totBudget.ToString("0.#", CultureInfo.InvariantCulture) + S("\\uff09");
+            if (pct >= critPct && !totalCritShown)
+            {
+                totalCritShown = true;
+                tray.ShowBalloonTip(8000, S("\\u004c\\u0069\\u0074\\u0065\\u004c\\u004c\\u004d\\u0020\\u989d\\u5ea6\\u544a\\u6025"), info, ToolTipIcon.Warning);
+            }
+            if (pct < warnPct - 5) totalCritShown = false;
         }
 
         // =============== render ===============
@@ -845,20 +974,27 @@ namespace LiteLLMWidget
                 // (no x/y => never fights the docked/retracted position)
                 SetWindowPos(Handle, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
                 DumpState();
+                double spend, budget; int okKeys, overKeys;
+                Totals(out spend, out budget, out okKeys, out overKeys);
+                CheckTotalThresholds(spend, budget);
                 if (spend >= 0 && budget > 0)
                 {
                     double pct = spend / budget * 100.0;
-                    overLimit = spend >= budget;
+                    bool allOver = (okKeys > 0 && overKeys == okKeys);
                     lblMain.Text = S("\\u00a5") + spend.ToString("0.##", CultureInfo.InvariantCulture) +
                                    S("\\u0020\\u002f\\u0020\\u00a5") + budget.ToString("0.##", CultureInfo.InvariantCulture);
-                    lblPct.Text = (overLimit ? S("\\u2265") : "") + pct.ToString("0.#", CultureInfo.InvariantCulture) + "%";
+                    lblPct.Text = (allOver ? S("\\u2265") : "") + pct.ToString("0.#", CultureInfo.InvariantCulture) + "%";
                     Color c = LevelColor();
-                    lblMain.ForeColor = (overLimit || pct >= warnPct) ? c : Color.White;
+                    lblMain.ForeColor = (allOver || pct >= warnPct) ? c : Color.White;
                     lblPct.ForeColor = c;
-                    if (overLimit) { lblSub.Text = S("\\u5df2\\u8d85\\u9650\\uff0c\\u7b49\\u7ba1\\u7406\\u5458\\u91cd\\u7f6e"); lblSub.ForeColor = Color.FromArgb(244, 67, 54); }
+                    if (allOver) { lblSub.Text = S("\\u5df2\\u5168\\u90e8\\u8d85\\u9650\\uff0c\\u7b49\\u7ba1\\u7406\\u5458\\u91cd\\u7f6e"); lblSub.ForeColor = Color.FromArgb(244, 67, 54); }
                     else
                     {
-                        lblSub.Text = S("\\u5269\\u4f59\\u0020\\u00a5") + (budget - spend).ToString("0.##", CultureInfo.InvariantCulture);
+                        double remaining = 0;
+                        foreach (KeyState ks in keys)
+                            if (ks.spend >= 0 && ks.budget > 0) remaining += Math.Max(0, ks.budget - ks.spend);
+                        lblSub.Text = S("\\u5269\\u4f59\\u0020\\u00a5") + remaining.ToString("0.##", CultureInfo.InvariantCulture) +
+                                      (overKeys > 0 ? S("\\uff08") + overKeys + "/" + okKeys + S("\\u0020\\u8d85\\u9650\\uff09") : "");
                         lblSub.ForeColor = Color.FromArgb(150, 150, 158);
                     }
                     lblStatus.Text = lastOk.ToString("HH:mm:ss");
@@ -871,6 +1007,33 @@ namespace LiteLLMWidget
                     lblStatus.Text = errStatus != null ? S("\\u5931\\u8d25") : S("\\u2026");
                     lblStatus.ForeColor = Color.FromArgb(255, 152, 0);
                     lblSub.Text = S("\\u7b49\\u5f85\\u6570\\u636e\\u2026");
+                }
+                // per-key mini rows (indexes, stable order; extras fold into the last line)
+                for (int i = 0; i < keyRowLabels.Count; i++)
+                {
+                    Label lr = keyRowLabels[i];
+                    if (i >= keys.Count) { lr.Text = ""; continue; }
+                    if (keys.Count > MaxKeyRows && i == MaxKeyRows - 1)
+                    {
+                        lr.Text = "+ " + (keys.Count - MaxKeyRows + 1) + " more";
+                        lr.ForeColor = Color.FromArgb(120, 120, 128);
+                        continue;
+                    }
+                    KeyState ks = keys[i];
+                    if (ks.spend >= 0 && ks.budget > 0)
+                    {
+                        double kp = ks.spend / ks.budget * 100.0;
+                        lr.Text = (ks.overLimit ? S("\\u8d85\\u9650\\u0020") : "") + ks.name + "  " +
+                                  kp.ToString("0.#", CultureInfo.InvariantCulture) + "%" +
+                                  S("\\u0020\\u0020\\u00a5") + ks.spend.ToString("0.##", CultureInfo.InvariantCulture) +
+                                  "/" + ks.budget.ToString("0.#", CultureInfo.InvariantCulture);
+                        lr.ForeColor = KeyLevelColor(ks);
+                    }
+                    else
+                    {
+                        lr.Text = ks.name + "  " + S("\\u2026") + (ks.err != null ? " !" : "");
+                        lr.ForeColor = Color.FromArgb(120, 120, 128);
+                    }
                 }
                 if (errStatus != null) toolTip.SetToolTip(lblStatus, errStatus);
                 else toolTip.SetToolTip(lblStatus, S("\\u6700\\u8fd1\\u4e00\\u6b21\\u6210\\u529f\\u66f4\\u65b0\\uff08\\u53cc\\u51fb\\u7acb\\u5373\\u5237\\u65b0\\uff09"));
@@ -901,17 +1064,32 @@ namespace LiteLLMWidget
         {
             try
             {
-                // never dump raw baseUrl/apiKey: a corrupted config can merge the key into
-                // other fields, and this file is a plain-text debug artifact
+                // never dump raw baseUrl/apiKeys: a corrupted config can merge the key into
+                // other fields, and this file is a plain-text debug artifact. Keys appear as
+                // stable indexes (k0,k1,...) because key_names may be non-ASCII.
                 string bstate = (baseUrl == null || baseUrl.IndexOf(' ') >= 0 || !baseUrl.StartsWith("http")) ? "INVALID" : "OK";
+                double totSpend, totBudget; int okKeys, overKeys;
+                Totals(out totSpend, out totBudget, out okKeys, out overKeys);
+                StringBuilder ksB = new StringBuilder(), klB = new StringBuilder();
+                int worstFail = 0;
+                for (int i = 0; i < keys.Count; i++)
+                {
+                    KeyState ks = keys[i];
+                    if (i > 0) { ksB.Append(','); klB.Append(','); }
+                    ksB.Append("k" + i + ":" + ks.spend.ToString(CultureInfo.InvariantCulture) +
+                               "/" + ks.budget.ToString(CultureInfo.InvariantCulture) +
+                               (ks.overLimit ? "/over" : ""));
+                    klB.Append("k" + i + ":" + (ks.key == null ? -1 : ks.key.Length));
+                    if (ks.failCount > worstFail) worstFail = ks.failCount;
+                }
                 string p = Path.Combine(Path.GetDirectoryName(cfgPath), "last-state.txt");
                 File.WriteAllText(p, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") +
-                    " | spend=" + spend.ToString(CultureInfo.InvariantCulture) +
-                    " | budget=" + budget.ToString(CultureInfo.InvariantCulture) +
+                    " | keys=" + (ksB.Length > 0 ? ksB.ToString() : "-") +
+                    " | total=" + totSpend.ToString(CultureInfo.InvariantCulture) + "/" + totBudget.ToString(CultureInfo.InvariantCulture) +
                     " | err=" + (errStatus == null ? "-" : AsciiOnly(errStatus)) +
-                    " | failCount=" + failCount +
+                    " | failCount=" + worstFail +
                     " | baseUrl=" + bstate +
-                    " | keyLen=" + (apiKey == null ? -1 : apiKey.Length) +
+                    " | keyLen=" + (klB.Length > 0 ? klB.ToString() : "-") +
                     " | model=" + probeModel +
                     " | opacity=" + Opacity.ToString("0.##", CultureInfo.InvariantCulture) +
                     " | dock=" + dockedEdge + (peeking ? "+peek" : "") +
